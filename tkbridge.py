@@ -106,6 +106,32 @@ def descendants(pid):
     return result  # order: shallow->deep; caller reverses for kill order
 
 
+def read_cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def inspect_target(pid):
+    """Full protection judgement for one kill target.
+
+    Returns a reason string when the target must NOT be signalled
+    (other uid, protected cmdline, or not inspectable), else None.
+    Same checks as the root pid: uid + real cmdline protection.
+    """
+    uid = proc_uid(pid)
+    if uid is None:
+        return "検査できませんでした"
+    if uid != MY_UID:
+        return "他ユーザーのプロセス"
+    cmd = read_cmdline(pid)
+    if cmd is None:
+        return "検査できませんでした"
+    return protect_reason(pid, cmd)
+
+
 def do_kill(body):
     try:
         pid = int(body.get("pid"))
@@ -119,10 +145,8 @@ def do_kill(body):
         return {"ok": False, "error": f"PID {pid} は既に存在しません"}
     if proc_uid(pid) != MY_UID:
         return {"ok": False, "error": "他ユーザーのプロセスは終了できません"}
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
-    except Exception:
+    cmd = read_cmdline(pid)
+    if cmd is None:
         cmd = ""
     reason = protect_reason(pid, cmd)
     if reason:
@@ -131,11 +155,16 @@ def do_kill(body):
     if tree:
         targets = list(reversed(descendants(pid))) + [pid]
     sig = signal.SIGTERM if sig_name == "TERM" else signal.SIGKILL
-    killed, errors = [], []
+    killed, errors, skipped = [], [], []
     for t in targets:
-        r = protect_reason(t, "")
-        if t != pid and r:
-            continue
+        if t != pid:
+            # Descendants get the SAME uid + real-cmdline protection
+            # judgement as the root; uninspectable ones are skipped
+            # and reported, never signalled.
+            r = inspect_target(t)
+            if r:
+                skipped.append({"pid": t, "reason": r})
+                continue
         try:
             os.kill(t, sig)
             killed.append(t)
@@ -143,7 +172,8 @@ def do_kill(body):
             pass
         except PermissionError:
             errors.append(t)
-    return {"ok": True, "killed": killed, "errors": errors, "sig": sig_name}
+    return {"ok": True, "killed": killed, "errors": errors,
+            "skipped": skipped, "sig": sig_name}
 
 
 class Handler(BaseHTTPRequestHandler):
